@@ -1,17 +1,25 @@
 import re
 
 from numpy.ma import sqrt
+#from pyspark import SparkContext, SparkConf
 from pyspark import SparkContext, SparkConf
-from pyspark.sql import SparkSession
+from pyspark.sql import SQLContext, SparkSession, Row
 from pyspark.shell import spark
 from pyspark.streaming import StreamingContext
 from pyspark.mllib.clustering import KMeans
 from pyspark.streaming.kafka import KafkaUtils
+from datetime import datetime
+from influxdb import InfluxDBClient
 
-#spark = SparkSession.builder.master("spark://192.168.56.1:7077").appName("Network Log Analyser").getOrCreate()
 
-#set up spark config
+
 conf = SparkConf().setAppName("Network Log Analyser").setMaster("spark://192.168.56.1:7077")
+conf.set("spark.executor.heartbeatInterval", "60s")
+conf.set("spark.network.timeout", "720s")
+
+#spark = SparkSession.builder.master("spark://192.168.56.1:7077").appName("Network Log Analyser").config("spark.some.config.option", "some-value").getOrCreate()
+
+#sc = spark.sparkContext
 
 sc = SparkContext.getOrCreate(conf = conf)
 
@@ -32,7 +40,10 @@ print('from kafka')
 
 def parse_log_line(logline, pattern):
     line = re.match(pattern, logline)
-    logline = line.groupdict()
+
+    if line:
+         logline = line.groupdict()
+
     print('logline now ')
     print(logline)
 
@@ -43,6 +54,7 @@ def parse_log_line(logline, pattern):
     if str(logline['response_code']).startswith("2"):
         twoxx = 1
     # If response code is 5xx, then we set the count for nxx is 1
+    elif str(logline['response_code']).startswith("5"):
         nxx = 1
 
     # return data in the form (1.1.1.1, [1, 0])
@@ -56,18 +68,6 @@ def extract_features(val1, val2):
 
     return [twoxx, nxx]
 
-def load(stream, model):
-    #rawTestingData = stream.map(lambda s: parse_log_line(s, APACHE_ACCESS_LOG_PATTERN))
-    print('load called')
-    testing_data = stream.reduceByKeyAndWindow(extract_features, lambda a, b: [a[0] - b[0], a[1] - b[1]], 60, 60).\
-                    map(lambda s: predict_cluster(s, model))
-
-    print("before printng")
-    print(testing_data)
-    return testing_data
-
-
-
 # Cluster Prediction and distance calculation
 def predict_cluster(row, model):
     # Predict the cluster for the current data row
@@ -79,8 +79,38 @@ def predict_cluster(row, model):
     # Calculate the disance between the Current Row Data and Cluster Center
     distance = sqrt(sum([x ** 2 for x in (row[1] - center)]))
 
-    return (row[0], distance, {"cluster": model.predict(row[1]), "twoxx": row[1][0], "nxx": row[1][1]})
+    #return (row[0], distance, {"cluster": model.predict(row[1]), "twoxx": row[1][0], "nxx": row[1][1]})
+    return (row[0], distance, model.predict(row[1]), row[1][0], row[1][1])
 
+def getSparkSessionInstance(sparkConf):
+    if ("sparkSessionSingletonInstance" not in globals()):
+        globals()["sparkSessionSingletonInstance"] = SparkSession \
+            .builder \
+            .config(conf=conf) \
+            .getOrCreate()
+    return globals()["sparkSessionSingletonInstance"]
+
+def sendRecord(tup):
+    source = tup[0]
+    distance = tup[1]
+    cluster = tup[2]
+    twoxx = tup[3]
+    nxx = tup[4]
+
+    events = [{
+        "measurement":"distance",
+        "tags":{
+            "source":tup[0],
+            "cluster":tup[2]
+        },
+        "fields":
+        {
+        "deviation":tup[1]
+        }
+        }]
+
+    dbclient= InfluxDBClient('localhost', 8086, 'root', 'root', 'example')
+    dbclient.write_points(events)
 
 logfilepath = 'D:\\Big data\\PycharmSource\\ML network detection\\test_access_log.txt'
 
@@ -103,8 +133,6 @@ training_dataset =rawTrainingData.map(lambda data: data[1])
 print("before training dataset")
 print(training_dataset.count())
 print(training_dataset)
-print("hoii")
-
 #set cluster count equals to 2
 cluster_count = 2
 
@@ -118,39 +146,25 @@ for center in range(cluster_count):
 
 #streamingData = KafkaUtils.createStream(ssc, "localhost:2181", "test-consumer-group", {"test" : 1})
 #lines = streamingData.map(lambda x:x[1])
-print("hiiiii")
-#print(lines)
 
-#counts = lines.flatMap(lambda line: line.split(" ")).map(lambda word: (word, 1)).reduceByKey(lambda a, b: a+b)
-#counts.pprint()
+stream_data = ssc.textFileStream("file:///D:/logsfolder").map(lambda s: parse_log_line(s, APACHE_ACCESS_LOG_PATTERN)).reduceByKeyAndWindow(extract_features, lambda a, b: [a[0] - b[0], a[1] - b[1]], 60, 60)#.map(lambda s: predict_cluster(s, trained_model))
+# .map(lambda s: predict_cluster(s, trained_model))
 
-# Process incoming JSON Logs from Kafka Stream
-#streamingData = KafkaUtils.createStream(ssc, "localhost:2181", "test-consumer-group", {"test" : 1}).cache()
-#localStream = KafkaUtils.createStream(ssc, "localhost:2181", "test-consumer-group", {"test": 1})#.cache()
-#print(localStream)
-#rawTestingData = streamingData.map(lambda s: parse_log_line(s, APACHE_ACCESS_LOG_PATTERN))
-
-# Reduce 60 seconds of incoming data in a 60 seconds sliding window and calculate distance from cluster center it belongs to
-#testing_data = rawTestingData.reduceByKeyAndWindow(extract_features, lambda a, b: [a[0] - b[0], a[1] - b[1]], 60, 60).map(lambda s: predict_cluster(s, trained_model))
-
-stream_data = ssc.textFileStream("file:///D:/logsfolder").map(lambda s: parse_log_line(s, APACHE_ACCESS_LOG_PATTERN)).reduceByKeyAndWindow(extract_features, lambda a, b: [a[0] - b[0], a[1] - b[1]], 60, 60).map(lambda s: predict_cluster(s, trained_model))
-    #map( lambda x: x.split(" "))
-#map(lambda s: parse_log_line(s, APACHE_ACCESS_LOG_PATTERN))
-
-print("please please")
+print("RDD data")
 stream_data.pprint()
+
+type(stream_data)
+
+print("for each loop  before ")
+print(stream_data)
+#stream_data.foreachRDD(takeprint)
+stream_data.foreachRDD(lambda rdd: rdd.foreach(sendRecord))
+
 print(stream_data.count())
 
-dataRDD = load(stream_data, trained_model)
-print(dataRDD)
-print("yukkkkk")
-
-
-#print(dataRDD)
 ssc.start()
 ssc.awaitTermination()
-
-sc.stop()
+ssc.stop()
 
 
 
